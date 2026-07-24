@@ -1,5 +1,7 @@
 // Integração com a API da OpenAI: validação de chave, autocomplete e Whisper.
 
+import { coerceEditOp, type EditOp } from './editKit'
+
 export interface AttachmentContext {
   name: string
   content: string
@@ -395,6 +397,173 @@ export async function applyInstruction(req: ApplyInstructionRequest): Promise<st
     temperature: 0.2,
     maxTokens: 4096,
   })
+}
+
+// ---------- kit de edições posicionais ----------
+
+export interface EditKitRequest {
+  apiKey: string
+  model: string
+  instruction: string
+  fullText: string
+  attachments?: AttachmentContext[]
+  signal?: AbortSignal
+}
+
+function buildEditKitSystemPrompt(): string {
+  return [
+    'Você é um editor de texto que trabalha por EDIÇÕES CIRÚRGICAS: nunca reescreve o documento inteiro.',
+    'O usuário deu uma instrução. Devolva um "kit" de edições em JSON que aplique a instrução mexendo SOMENTE nos trechos necessários, possivelmente em vários pontos diferentes.',
+    'Formato EXATO: {"edicoes":[ ... ]}. Cada item é um objeto com "tipo" e campos:',
+    '- {"tipo":"substituir","encontrar":"<trecho EXATO já existente>","texto":"<novo trecho>"}',
+    '- {"tipo":"inserir_apos","encontrar":"<trecho EXATO já existente>","texto":"<texto a inserir depois dele>"}',
+    '- {"tipo":"inserir_antes","encontrar":"<trecho EXATO já existente>","texto":"<texto a inserir antes dele>"}',
+    '- {"tipo":"inicio","texto":"<texto a inserir no começo do documento>"}',
+    '- {"tipo":"fim","texto":"<texto a inserir no fim do documento>"}',
+    'Regras obrigatórias:',
+    '- "encontrar" deve ser uma cópia LITERAL e curta de um trecho que existe no documento atual — o menor trecho que identifique o ponto sem ambiguidade. Copie pontuação, acentos e maiúsculas exatamente.',
+    '- Prefira o MENOR número de edições. Não repita trechos que não mudam.',
+    '- Para acrescentar conteúdo novo, use inserir_apos / inserir_antes / inicio / fim; use substituir só quando realmente troca texto existente.',
+    '- Liste as edições na ordem em que aparecem no documento.',
+    '- Respeite o idioma e a formatação (Markdown) do documento.',
+    '- Responda APENAS com o JSON, sem explicações nem cercas de código.',
+    '- Se nada precisar mudar, devolva {"edicoes":[]}.',
+  ].join('\n')
+}
+
+/** Extrai o array de operações de uma resposta JSON tolerante a formatos. */
+function parseEditKit(raw: string): EditOp[] {
+  let data: unknown
+  try {
+    data = JSON.parse(normalizeModelText(raw))
+  } catch {
+    return []
+  }
+  const list = Array.isArray(data)
+    ? data
+    : Array.isArray((data as Record<string, unknown>)?.edicoes)
+      ? ((data as Record<string, unknown>).edicoes as unknown[])
+      : Array.isArray((data as Record<string, unknown>)?.edits)
+        ? ((data as Record<string, unknown>).edits as unknown[])
+        : []
+  const ops: EditOp[] = []
+  for (const item of list) {
+    const op = coerceEditOp(item)
+    if (op) ops.push(op)
+  }
+  return ops
+}
+
+export async function fetchEditKit(req: EditKitRequest): Promise<EditOp[]> {
+  const attachments = buildAttachmentsBlock(req.attachments ?? [])
+  const user =
+    attachments +
+    `<documento>\n${req.fullText}\n</documento>\n\n` +
+    `Instrução do usuário:\n${req.instruction.slice(0, MAX_BRIEFING)}\n\n` +
+    'Devolva o kit de edições em JSON:'
+
+  const raw = await chatCompletion({
+    apiKey: req.apiKey,
+    model: req.model,
+    messages: [
+      { role: 'system', content: buildEditKitSystemPrompt() },
+      { role: 'user', content: user },
+    ],
+    temperature: 0.2,
+    // Teto alto: em modelos restritos inclui os tokens de raciocínio, e o JSON
+    // com vários trechos copiados pode ser longo.
+    maxTokens: isRestrictedModel(req.model) ? 8000 : 4096,
+    responseFormat: { type: 'json_object' },
+    signal: req.signal,
+  })
+  return parseEditKit(raw)
+}
+
+// ---------- ideias (brainstorming guiado) ----------
+
+export interface Idea {
+  title: string
+  content: string
+}
+
+export interface IdeasRequest {
+  apiKey: string
+  model: string
+  need: string
+  beforeCursor: string
+  afterCursor: string
+  attachments: AttachmentContext[]
+  signal?: AbortSignal
+}
+
+function buildIdeasSystemPrompt(): string {
+  return [
+    'Você é um parceiro de brainstorming dentro de um bloco de notas. O usuário descreve uma necessidade e você propõe IDEIAS distintas para ajudá-lo.',
+    'Formato EXATO: {"ideias":[{"titulo":"<rótulo curto>","conteudo":"<texto pronto para inserir no documento>"}]}.',
+    'Regras obrigatórias:',
+    '- Gere de 4 a 6 ideias claramente diferentes entre si (ângulos, abordagens ou conteúdos distintos).',
+    '- "titulo": curto (até ~6 palavras), descreve a ideia.',
+    '- "conteudo": o texto que será INSERIDO no documento se o usuário escolher a ideia. Escreva-o pronto, sem preâmbulo, sem meta-comentário e sem repetir o título.',
+    '- Escreva no idioma do documento; se o documento estiver vazio, no idioma da necessidade.',
+    '- Use o texto ao redor do cursor e os anexos apenas como contexto (assunto, tom, termos); não os reproduza por inteiro.',
+    '- Se o documento usa Markdown, mantenha a sintaxe coerente.',
+    '- Responda APENAS com o JSON, sem explicações nem cercas de código.',
+  ].join('\n')
+}
+
+function parseIdeas(raw: string): Idea[] {
+  let data: unknown
+  try {
+    data = JSON.parse(normalizeModelText(raw))
+  } catch {
+    return []
+  }
+  const list = Array.isArray(data)
+    ? data
+    : Array.isArray((data as Record<string, unknown>)?.ideias)
+      ? ((data as Record<string, unknown>).ideias as unknown[])
+      : Array.isArray((data as Record<string, unknown>)?.ideas)
+        ? ((data as Record<string, unknown>).ideas as unknown[])
+        : []
+  const ideas: Idea[] = []
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue
+    const o = item as Record<string, unknown>
+    const title = typeof o.titulo === 'string' ? o.titulo : typeof o.title === 'string' ? o.title : ''
+    const content =
+      typeof o.conteudo === 'string' ? o.conteudo : typeof o.content === 'string' ? o.content : ''
+    if (content.trim()) {
+      ideas.push({ title: title.trim() || 'Ideia', content: content.trim() })
+    }
+    if (ideas.length >= 8) break
+  }
+  return ideas
+}
+
+export async function fetchIdeas(req: IdeasRequest): Promise<Idea[]> {
+  const before = req.beforeCursor.slice(-MAX_BEFORE)
+  const after = req.afterCursor.slice(0, MAX_AFTER)
+  const user =
+    buildAttachmentsBlock(req.attachments) +
+    `<necessidade_do_usuario>\n${req.need.slice(0, MAX_BRIEFING)}\n</necessidade_do_usuario>\n\n` +
+    `<texto_antes_do_cursor>\n${before}\n</texto_antes_do_cursor>\n` +
+    `[CURSOR]\n` +
+    `<texto_depois_do_cursor>\n${after}\n</texto_depois_do_cursor>\n\n` +
+    'Gere as ideias em JSON:'
+
+  const raw = await chatCompletion({
+    apiKey: req.apiKey,
+    model: req.model,
+    messages: [
+      { role: 'system', content: buildIdeasSystemPrompt() },
+      { role: 'user', content: user },
+    ],
+    temperature: 0.8,
+    maxTokens: isRestrictedModel(req.model) ? 6000 : 2000,
+    responseFormat: { type: 'json_object' },
+    signal: req.signal,
+  })
+  return parseIdeas(raw)
 }
 
 export async function transcribeAudio(apiKey: string, blob: Blob): Promise<string> {

@@ -46,6 +46,7 @@ import AttachmentsPanel from '@/components/AttachmentsPanel'
 import GitHubContextDialog from '@/components/GitHubContextDialog'
 import AiEditDialog from '@/components/AiEditDialog'
 import AskSuggestionDialog from '@/components/AskSuggestionDialog'
+import IdeasDialog from '@/components/IdeasDialog'
 import TourOverlay from '@/components/tour/TourOverlay'
 import ToolbarButton from '@/components/toolbar/ToolbarButton'
 import CommandPalette from '@/components/CommandPalette'
@@ -100,11 +101,20 @@ import {
   applyInstruction,
   classifyUtterance,
   fetchCompletion,
+  fetchEditKit,
   fetchGuidedSuggestion,
+  fetchIdeas,
   looksLikeCommand,
   transcribeAudio,
   validateApiKey,
+  type Idea,
 } from '@/lib/openai'
+import {
+  applyEditKit,
+  describeEditKit,
+  insertTextAtAnchor,
+  type EditOp,
+} from '@/lib/editKit'
 import { LOGO_URL } from '@/lib/brand'
 import { getCached, invalidate, setCached } from '@/lib/suggestionCache'
 import {
@@ -127,6 +137,15 @@ interface HistoryItem {
   content: string
   cursor: number
 }
+
+/**
+ * Como uma edição da IA será aplicada. `selection` troca só o intervalo
+ * selecionado; `kit` aplica edições cirúrgicas em vários pontos (sem reescrever
+ * o documento inteiro).
+ */
+type AiEditPlan =
+  | { kind: 'kit'; edits: EditOp[] }
+  | { kind: 'selection'; start: number; end: number; text: string }
 
 type ViewMode = 'edit' | 'split' | 'preview'
 type RecState = 'idle' | 'recording' | 'transcribing'
@@ -153,21 +172,6 @@ const DEFAULT_MODEL = MODEL_OPTIONS[1].id
 const AUTOCOMPLETE_DELAY_MS = 800
 
 /**
- * Quebras de linha necessárias em volta de um texto inserido, contando as que já
- * existem: `\n\n` cego somaria a uma quebra existente e abriria um vão duplo no
- * preview de Markdown.
- */
-function padForInsert(before: string, after: string): { lead: string; tail: string } {
-  const countBreaks = (s: string) => (s.match(/\n/g) ?? []).length
-  const tailWs = /[ \t\n]*$/.exec(before)?.[0] ?? ''
-  const headWs = /^[ \t\n]*/.exec(after)?.[0] ?? ''
-  return {
-    lead: before.trim() === '' ? '' : '\n'.repeat(Math.max(0, 2 - countBreaks(tailWs))),
-    tail: after.trim() === '' ? '' : '\n'.repeat(Math.max(0, 2 - countBreaks(headWs))),
-  }
-}
-
-/**
  * Atalhos globais.
  *
  * `mod+alt+…` porque as combinações mais curtas já pertencem ao navegador
@@ -183,6 +187,8 @@ const SC = {
   dictate: { key: 'd', mod: true, alt: true } satisfies Shortcut,
   aiEdit: { key: 'e', mod: true, alt: true } satisfies Shortcut,
   askSuggestion: { key: 's', mod: true, alt: true } satisfies Shortcut,
+  // +shift mantém o mnemônico "i" sem colidir com ⌘⌥I (DevTools no macOS).
+  ideas: { key: 'i', mod: true, alt: true, shift: true } satisfies Shortcut,
   fullscreen: { key: 'f', mod: true, alt: true } satisfies Shortcut,
   retry: { key: 'r', mod: true, alt: true } satisfies Shortcut,
   attach: { key: 'a', mod: true, alt: true } satisfies Shortcut,
@@ -276,10 +282,18 @@ export default function Home() {
   const [aiEditOpen, setAiEditOpen] = useState(false)
   const [aiEditPreview, setAiEditPreview] = useState<string | null>(null)
   const [aiEditLoading, setAiEditLoading] = useState(false)
+  const [aiEditPlan, setAiEditPlan] = useState<AiEditPlan | null>(null)
   const [aiEditSelection, setAiEditSelection] = useState<{
     start: number
     end: number
   } | null>(null)
+
+  // ---------- ideias ----------
+  const [ideasOpen, setIdeasOpen] = useState(false)
+  const [ideasNeed, setIdeasNeed] = useState('')
+  const [ideas, setIdeas] = useState<Idea[] | null>(null)
+  const [ideasLoading, setIdeasLoading] = useState(false)
+  const [ideasAnchor, setIdeasAnchor] = useState(0)
 
   // ---------- pedir sugestão ----------
   const [askOpen, setAskOpen] = useState(false)
@@ -297,6 +311,11 @@ export default function Home() {
   // controller próprio: compartilhar com o autocomplete faria uma tecla digitada
   // cancelar a geração guiada em andamento
   const askAbortRef = useRef<AbortController | null>(null)
+  const ideasAbortRef = useRef<AbortController | null>(null)
+  // Para onde vai a próxima transcrição de voz. Fica num ref (não na closure do
+  // onstop) para que "Parar" no diálogo de Ideias entregue o texto ao campo de
+  // Ideias mesmo que a gravação tenha começado pelo microfone do editor.
+  const transcriptSinkRef = useRef<((transcript: string) => void) | null>(null)
   const editorRef = useRef<GhostEditorHandle>(null)
   const pageRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -525,6 +544,7 @@ export default function Home() {
     const sel = editorRef.current?.getSelection() ?? { start: 0, end: 0 }
     setAiEditSelection(sel.start === sel.end ? null : sel)
     setAiEditPreview(null)
+    setAiEditPlan(null)
     setAiEditOpen(true)
     tourAction('editar-ia')
   }, [tourAction])
@@ -534,53 +554,92 @@ export default function Home() {
       if (!apiKey || !unlocked) return
       setAiEditLoading(true)
       setAiEditPreview(null)
+      setAiEditPlan(null)
       try {
         const full = textRef.current
-        const selected =
-          aiEditSelection && onlySelection
-            ? full.slice(aiEditSelection.start, aiEditSelection.end)
-            : undefined
-        const result = await applyInstruction({
-          apiKey,
-          model,
-          instruction,
-          fullText: full,
-          selectedText: selected,
-        })
-        setAiEditPreview(result)
+        if (aiEditSelection && onlySelection) {
+          // Só a seleção: já é posicional, troca apenas o intervalo escolhido.
+          const selected = full.slice(aiEditSelection.start, aiEditSelection.end)
+          const result = await applyInstruction({
+            apiKey,
+            model,
+            instruction,
+            fullText: full,
+            selectedText: selected,
+          })
+          setAiEditPlan({
+            kind: 'selection',
+            start: aiEditSelection.start,
+            end: aiEditSelection.end,
+            text: result,
+          })
+          setAiEditPreview(result)
+        } else {
+          // Documento inteiro: kit de edições cirúrgicas em vez de reescrever tudo.
+          const edits = await fetchEditKit({
+            apiKey,
+            model,
+            instruction,
+            fullText: full,
+            attachments: (active?.attachments ?? []).map((a) => ({
+              name: a.name,
+              content: a.content,
+            })),
+          })
+          if (edits.length === 0) {
+            toast('A IA não retornou edições para essa instrução. Tente reformular.')
+            return
+          }
+          const { applied, missed } = applyEditKit(full, edits)
+          if (applied === 0) {
+            toast.error(
+              'Nenhuma edição pôde ser aplicada: os trechos não foram encontrados no texto.',
+            )
+            return
+          }
+          setAiEditPlan({ kind: 'kit', edits })
+          setAiEditPreview(describeEditKit(edits, missed.length))
+        }
       } catch (e) {
         toast.error(e instanceof Error ? e.message : 'Falha ao gerar edição.')
       } finally {
         setAiEditLoading(false)
       }
     },
-    [apiKey, unlocked, model, aiEditSelection],
+    [apiKey, unlocked, model, aiEditSelection, active],
   )
 
   const handleAiEditApply = useCallback(() => {
-    if (!aiEditPreview) return
-    recordHistory()
-    if (!aiEditSelection) {
-      const next = aiEditPreview
-      textRef.current = next
-      updateActive({ content: next })
-      setCursor(next.length)
-      editorRef.current?.setCursor(next.length)
+    if (!aiEditPlan) return
+    const full = textRef.current
+    let next: string
+    let caret: number
+    if (aiEditPlan.kind === 'selection') {
+      next = full.slice(0, aiEditPlan.start) + aiEditPlan.text + full.slice(aiEditPlan.end)
+      caret = aiEditPlan.start + aiEditPlan.text.length
     } else {
-      const full = textRef.current
-      const before = full.slice(0, aiEditSelection.start)
-      const after = full.slice(aiEditSelection.end)
-      const next = before + aiEditPreview + after
-      const pos = aiEditSelection.start + aiEditPreview.length
-      textRef.current = next
-      updateActive({ content: next })
-      setCursor(pos)
-      editorRef.current?.setCursor(pos)
+      const r = applyEditKit(full, aiEditPlan.edits)
+      if (r.applied === 0) {
+        toast.error('Nenhuma edição pôde ser aplicada: os trechos não foram encontrados.')
+        return
+      }
+      next = r.text
+      caret = r.caret
+      if (r.missed.length > 0) {
+        toast(`${r.missed.length} edição(ões) foram ignoradas (trecho não encontrado).`)
+      }
     }
+    recordHistory()
+    textRef.current = next
+    cursorRef.current = caret
+    updateActive({ content: next })
+    setCursor(caret)
+    editorRef.current?.setCursor(caret)
     setAiEditOpen(false)
     setAiEditPreview(null)
+    setAiEditPlan(null)
     toast.success('Edição aplicada.')
-  }, [aiEditPreview, aiEditSelection, recordHistory, updateActive])
+  }, [aiEditPlan, recordHistory, updateActive])
 
   // ---------- pedir sugestão ----------
   const openAskSuggestion = useCallback(() => {
@@ -656,14 +715,7 @@ export default function Home() {
 
     recordHistory() // fotografa textRef/cursorRef: tem que rodar antes da sobrescrita
 
-    const full = textRef.current
-    const pos = Math.min(askAnchor, full.length)
-    const before = full.slice(0, pos)
-    const after = full.slice(pos)
-    const { lead, tail } = padForInsert(before, after)
-
-    const next = before + lead + text + tail + after
-    const caret = pos + lead.length + text.length
+    const { text: next, caret } = insertTextAtAnchor(textRef.current, askAnchor, text)
 
     textRef.current = next
     cursorRef.current = caret
@@ -896,81 +948,223 @@ export default function Home() {
     if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
   }, [])
 
-  const startRecording = useCallback(async () => {
-    if (!apiKey) return
-    tourAction('ditar')
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : undefined
-      const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
-      chunksRef.current = []
-      rec.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data)
-      }
-      rec.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop())
-        const blob = new Blob(chunksRef.current, {
-          type: rec.mimeType || 'audio/webm',
-        })
-        setRecState('transcribing')
-        try {
-          const transcript = await transcribeAudio(apiKey, blob)
-          if (!transcript) {
-            toast('Não consegui entender o áudio.')
+  const startRecording = useCallback(
+    async (onTranscript?: (transcript: string) => void) => {
+      if (!apiKey) return
+      transcriptSinkRef.current = onTranscript ?? null
+      // O ditado do editor conta como passo do tour; a captura para um sink
+      // externo (ex.: campo de Ideias) não.
+      if (!onTranscript) tourAction('ditar')
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : undefined
+        const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
+        chunksRef.current = []
+        rec.ondataavailable = (e) => {
+          if (e.data.size > 0) chunksRef.current.push(e.data)
+        }
+        rec.onstop = async () => {
+          stream.getTracks().forEach((t) => t.stop())
+          const blob = new Blob(chunksRef.current, {
+            type: rec.mimeType || 'audio/webm',
+          })
+          setRecState('transcribing')
+          try {
+            const transcript = await transcribeAudio(apiKey, blob)
+            if (!transcript) {
+              toast('Não consegui entender o áudio.')
+              return
+            }
+            // Sink externo: entrega a transcrição crua e não mexe no editor.
+            // Lido do ref (não da closure): reflete onde o usuário mandou parar.
+            const sink = transcriptSinkRef.current
+            if (sink) {
+              sink(transcript)
+              return
+            }
+            // Pré-filtro: só chama a IA se o transcript parecer um comando.
+            // Isso evita que frases normais sejam confundidas com instruções
+            // e substituam o documento por engano.
+            let classified: { type: 'transcription' | 'instruction'; payload: string }
+            if (looksLikeCommand(transcript)) {
+              classified = await classifyUtterance(
+                apiKey,
+                model,
+                transcript,
+                textRef.current,
+              )
+            } else {
+              classified = { type: 'transcription', payload: transcript }
+            }
+            if (classified.type === 'transcription') {
+              recordHistory()
+              editorRef.current?.insertAtCursor(classified.payload)
+              toast.success('Transcrição inserida no cursor.')
+            } else {
+              // Comando de edição: kit de edições cirúrgicas, não reescreve o
+              // documento inteiro nem joga o cursor para o fim.
+              toast.info('Comando de edição detectado.')
+              const edits = await fetchEditKit({
+                apiKey,
+                model,
+                instruction: classified.payload,
+                fullText: textRef.current,
+                attachments: (active?.attachments ?? []).map((a) => ({
+                  name: a.name,
+                  content: a.content,
+                })),
+              })
+              const { text: next, caret, applied, missed } = applyEditKit(
+                textRef.current,
+                edits,
+              )
+              if (applied === 0) {
+                toast('Não consegui aplicar esse comando ao texto.')
+                return
+              }
+              recordHistory()
+              textRef.current = next
+              cursorRef.current = caret
+              updateActive({ content: next })
+              setCursor(caret)
+              editorRef.current?.setCursor(caret)
+              if (missed.length > 0) {
+                toast(`${missed.length} parte(s) do comando foram ignoradas.`)
+              }
+              toast.success('Edição aplicada pelo comando de voz.')
+            }
+          } catch (e) {
+            toast.error(e instanceof Error ? e.message : 'Falha na transcrição.')
+          } finally {
             setRecState('idle')
-            return
           }
-          // Pré-filtro: só chama a IA se o transcript parecer um comando.
-          // Isso evita que frases normais sejam confundidas com instruções
-          // e substituam o documento inteiro por engano.
-          let classified: { type: 'transcription' | 'instruction'; payload: string }
-          if (looksLikeCommand(transcript)) {
-            classified = await classifyUtterance(
-              apiKey,
-              model,
-              transcript,
-              textRef.current,
-            )
-          } else {
-            classified = { type: 'transcription', payload: transcript }
-          }
-          if (classified.type === 'transcription') {
-            recordHistory()
-            editorRef.current?.insertAtCursor(classified.payload)
-            toast.success('Transcrição inserida no cursor.')
-          } else {
-            toast.info('Comando de edição detectado.')
-            recordHistory()
-            const edited = await applyInstruction({
-              apiKey,
-              model,
-              instruction: classified.payload,
-              fullText: textRef.current,
-            })
-            textRef.current = edited
-            updateActive({ content: edited })
-            setCursor(edited.length)
-            editorRef.current?.setCursor(edited.length)
-            toast.success('Edição aplicada pelo comando de voz.')
-          }
-        } catch (e) {
-          toast.error(e instanceof Error ? e.message : 'Falha na transcrição.')
-        } finally {
-          setRecState('idle')
+        }
+        recorderRef.current = rec
+        rec.start()
+        setRecState('recording')
+        toast.info('Gravando… toque no microfone novamente para parar.', {
+          position: 'top-center',
+        })
+      } catch {
+        toast.error('Não foi possível acessar o microfone. Verifique a permissão.')
+      }
+    },
+    [apiKey, model, active, recordHistory, updateActive, tourAction],
+  )
+
+  // ---------- ideias ----------
+  const openIdeas = useCallback(() => {
+    // sem isso o debounce dispara com o modal aberto e um ghost aparece atrás dele
+    window.clearTimeout(debounceRef.current)
+    const sel = editorRef.current?.getSelection()
+    // havendo seleção, aplicamos DEPOIS dela: nunca destruímos texto selecionado
+    setIdeasAnchor(sel ? sel.end : cursorRef.current)
+    setIdeas(null)
+    setIdeasNeed('')
+    setSuggestion(null)
+    setIdeasOpen(true)
+  }, [])
+
+  const handleIdeasOpenChange = useCallback(
+    (open: boolean) => {
+      if (!open) {
+        ideasAbortRef.current?.abort()
+        ideasAbortRef.current = null
+        setIdeasLoading(false)
+        if (recState === 'recording') stopRecording()
+      }
+      setIdeasOpen(open)
+    },
+    [recState, stopRecording],
+  )
+
+  const toggleIdeasRecording = useCallback(() => {
+    const ideasSink = (transcript: string) =>
+      setIdeasNeed((prev) => (prev.trim() ? prev.trim() + ' ' : '') + transcript)
+    if (recState === 'recording') {
+      // adota a gravação em curso: ao parar aqui, o texto vai para o campo de
+      // Ideias mesmo que a gravação tenha começado pelo microfone do editor.
+      transcriptSinkRef.current = ideasSink
+      stopRecording()
+      return
+    }
+    void startRecording(ideasSink)
+  }, [recState, stopRecording, startRecording])
+
+  const handleIdeasGenerate = useCallback(
+    async (need: string) => {
+      if (!apiKey || !unlocked) return
+      const trimmed = need.trim()
+      if (!trimmed) return
+
+      ideasAbortRef.current?.abort()
+      const ctrl = new AbortController()
+      ideasAbortRef.current = ctrl
+      setIdeasLoading(true)
+      setIdeas(null)
+      try {
+        const full = textRef.current
+        const pos = Math.min(ideasAnchor, full.length)
+        const out = await fetchIdeas({
+          apiKey,
+          model,
+          need: trimmed,
+          beforeCursor: full.slice(0, pos),
+          afterCursor: full.slice(pos),
+          attachments: (active?.attachments ?? []).map((a) => ({
+            name: a.name,
+            content: a.content,
+          })),
+          signal: ctrl.signal,
+        })
+        if (ctrl.signal.aborted) return
+        if (out.length === 0) {
+          toast('A IA não gerou ideias. Tente detalhar mais o pedido.')
+          return
+        }
+        setIdeas(out)
+      } catch (e) {
+        if (!ctrl.signal.aborted) {
+          toast.error(e instanceof Error ? e.message : 'Falha ao gerar ideias.')
+        }
+      } finally {
+        if (ideasAbortRef.current === ctrl) {
+          ideasAbortRef.current = null
+          setIdeasLoading(false)
         }
       }
-      recorderRef.current = rec
-      rec.start()
-      setRecState('recording')
-      toast.info('Gravando… toque no microfone novamente para parar.', {
-        position: 'top-center',
-      })
-    } catch {
-      toast.error('Não foi possível acessar o microfone. Verifique a permissão.')
-    }
-  }, [apiKey, model, recordHistory, updateActive, tourAction])
+    },
+    [apiKey, unlocked, model, active, ideasAnchor],
+  )
+
+  const handleApplyIdea = useCallback(
+    (idea: Idea) => {
+      const text = idea.content.trim()
+      if (!text || !active) return
+
+      recordHistory()
+      const { text: next, caret } = insertTextAtAnchor(textRef.current, ideasAnchor, text)
+      textRef.current = next
+      cursorRef.current = caret
+      updateActive({ content: next })
+      setCursor(caret)
+
+      // fecha pelo mesmo caminho de limpeza: aborta geração em voo e para uma
+      // gravação em curso (libera o microfone) em vez de deixá-la órfã.
+      handleIdeasOpenChange(false)
+
+      // o caret só pode ser reposicionado depois do commit do React e do Radix fechar
+      window.setTimeout(() => {
+        editorRef.current?.focus()
+        editorRef.current?.setCursor(caret)
+      }, 60)
+
+      toast.success('Ideia aplicada.')
+    },
+    [active, ideasAnchor, recordHistory, updateActive, handleIdeasOpenChange],
+  )
 
   // ---------- anexos (por página) ----------
   const handleFiles = useCallback(
@@ -1099,6 +1293,16 @@ export default function Home() {
         shortcut: SC.askSuggestion,
         tone: '#ff79c6',
         run: openAskSuggestion,
+      },
+      {
+        id: 'ia.ideias',
+        label: 'Ideias',
+        hint: 'Descreva por voz o que precisa; a IA gera ideias para aplicar',
+        group: 'escrita',
+        icon: HelpCircle,
+        shortcut: SC.ideas,
+        tone: '#ffb86c',
+        run: openIdeas,
       },
       {
         id: 'ia.ditar',
@@ -1264,6 +1468,7 @@ export default function Home() {
     [
       openAiEdit,
       openAskSuggestion,
+      openIdeas,
       handleDownloadImage,
       handleDownloadPdf,
       recState,
@@ -1513,6 +1718,11 @@ export default function Home() {
                 </DropdownMenuItem>
                 <DropdownMenuSeparator className="bg-[#44475a]" />
 
+                <DropdownMenuItem onClick={openIdeas} className={MI}>
+                  <HelpCircle className="mr-2 h-4 w-4 text-[#ffb86c]" />
+                  Ideias
+                  <MenuHint s={SC.ideas} />
+                </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => void requestCompletion(true)}
                   disabled={loading}
@@ -1847,9 +2057,10 @@ export default function Home() {
 
       {/* ================= Ações rápidas flutuantes no mobile (touch) ================= */}
       {isTouch && mode !== 'preview' && (
-        // gap-2, não gap-3: com 6 botões de 40px o gap maior estoura numa
-        // viewport de 320px (6×40 + 5×12 + 24 = 324px).
-        <div className="fade-in-up fixed bottom-4 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2 rounded-full border border-[#44475a] bg-[#21222c]/95 px-3 py-2 shadow-xl shadow-black/40 backdrop-blur-sm">
+        // 7 botões de 36px (h-9) com gap-1.5: 7×36 + 6×6 + px-3 (24) + borda (2)
+        // = 314px, ainda cabe numa viewport de 320px. Foi por isso que os botões
+        // encolheram de 40px para 36px ao entrar o botão de Ideias (?).
+        <div className="fade-in-up fixed bottom-4 left-1/2 z-40 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[#44475a] bg-[#21222c]/95 px-3 py-2 shadow-xl shadow-black/40 backdrop-blur-sm">
           <button
             onClick={() =>
               recState === 'recording' ? stopRecording() : void startRecording()
@@ -1857,7 +2068,7 @@ export default function Home() {
             aria-label={recState === 'recording' ? 'Parar gravação' : 'Ditar'}
             data-tour="mic"
             disabled={recState === 'transcribing'}
-            className={`flex h-10 w-10 items-center justify-center rounded-full transition-transform active:scale-95 disabled:opacity-50 ${
+            className={`flex h-9 w-9 items-center justify-center rounded-full transition-transform active:scale-95 disabled:opacity-50 ${
               recState === 'recording'
                 ? 'rec-pulse recording-ring bg-[#ff5555]/20 text-[#ff5555]'
                 : recState === 'transcribing'
@@ -1877,7 +2088,7 @@ export default function Home() {
             onClick={() => void undo()}
             aria-label="Desfazer"
             disabled={!canUndo}
-            className="flex h-10 w-10 items-center justify-center rounded-full bg-[#8be9fd]/15 text-[#8be9fd] transition-transform active:scale-95 disabled:opacity-30"
+            className="flex h-9 w-9 items-center justify-center rounded-full bg-[#8be9fd]/15 text-[#8be9fd] transition-transform active:scale-95 disabled:opacity-30"
           >
             <Undo2 className="h-5 w-5" />
           </button>
@@ -1885,7 +2096,7 @@ export default function Home() {
             onClick={() => void redo()}
             aria-label="Refazer"
             disabled={!canRedo}
-            className="flex h-10 w-10 items-center justify-center rounded-full bg-[#8be9fd]/15 text-[#8be9fd] transition-transform active:scale-95 disabled:opacity-30"
+            className="flex h-9 w-9 items-center justify-center rounded-full bg-[#8be9fd]/15 text-[#8be9fd] transition-transform active:scale-95 disabled:opacity-30"
           >
             <Redo2 className="h-5 w-5" />
           </button>
@@ -1895,9 +2106,20 @@ export default function Home() {
             }}
             aria-label="Editar com IA"
             data-tour="ai-edit"
-            className="flex h-10 w-10 items-center justify-center rounded-full bg-[#bd93f9]/15 text-[#bd93f9] transition-transform active:scale-95"
+            className="flex h-9 w-9 items-center justify-center rounded-full bg-[#bd93f9]/15 text-[#bd93f9] transition-transform active:scale-95"
           >
             <Wand2 className="h-5 w-5" />
+          </button>
+          {/*
+            Botão de Ideias (interrogação): descrevo por voz o que preciso e a IA
+            gera ideias para aplicar. Fica junto das ações de escrita com IA.
+          */}
+          <button
+            onClick={openIdeas}
+            aria-label="Ideias"
+            className="flex h-9 w-9 items-center justify-center rounded-full bg-[#ffb86c]/15 text-[#ffb86c] transition-transform active:scale-95"
+          >
+            <HelpCircle className="h-5 w-5" />
           </button>
           {/*
             Aceitar/dispensar ficam sempre montados e apenas desabilitam sem
@@ -1909,7 +2131,7 @@ export default function Home() {
             onClick={acceptSuggestion}
             aria-label="Aceitar sugestão"
             disabled={suggestion === null}
-            className="flex h-10 w-10 items-center justify-center rounded-full bg-[#50fa7b]/15 text-[#50fa7b] transition-transform active:scale-95 disabled:opacity-30"
+            className="flex h-9 w-9 items-center justify-center rounded-full bg-[#50fa7b]/15 text-[#50fa7b] transition-transform active:scale-95 disabled:opacity-30"
           >
             <CheckCircle2 className="h-5 w-5" />
           </button>
@@ -1917,7 +2139,7 @@ export default function Home() {
             onClick={() => setSuggestion(null)}
             aria-label="Dispensar sugestão"
             disabled={suggestion === null}
-            className="flex h-10 w-10 items-center justify-center rounded-full bg-[#ff5555]/15 text-[#ff5555] transition-transform active:scale-95 disabled:opacity-30"
+            className="flex h-9 w-9 items-center justify-center rounded-full bg-[#ff5555]/15 text-[#ff5555] transition-transform active:scale-95 disabled:opacity-30"
           >
             <X className="h-5 w-5" />
           </button>
@@ -2065,6 +2287,16 @@ export default function Home() {
               >
                 <Lightbulb className="h-5 w-5 text-[#ff79c6]" />
                 Sugestão
+              </button>
+              <button
+                className="drawer-btn"
+                onClick={() => {
+                  openIdeas()
+                  setDrawerOpen(false)
+                }}
+              >
+                <HelpCircle className="h-5 w-5 text-[#ffb86c]" />
+                Ideias
               </button>
             </div>
             <div className="mt-3">
@@ -2357,6 +2589,19 @@ export default function Home() {
         loading={askLoading}
         onGenerate={(b) => void handleAskGenerate(b)}
         onInsert={handleAskInsert}
+      />
+
+      <IdeasDialog
+        open={ideasOpen}
+        onOpenChange={handleIdeasOpenChange}
+        need={ideasNeed}
+        onNeedChange={setIdeasNeed}
+        ideas={ideas}
+        loading={ideasLoading}
+        recState={recState}
+        onToggleRecord={toggleIdeasRecording}
+        onGenerate={(n) => void handleIdeasGenerate(n)}
+        onApply={handleApplyIdea}
       />
 
       <Toaster

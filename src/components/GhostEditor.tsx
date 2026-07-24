@@ -82,6 +82,9 @@ const GhostEditor = forwardRef<GhostEditorHandle, GhostEditorProps>(
         onChange(next, start + text.length)
       },
       setCursor(pos: number) {
+        // Aplica já no DOM atual e deixa pendente: quando `value` mudar no mesmo
+        // commit (aceitar sugestão, undo/redo, aplicar edição), o efeito de
+        // layout reposiciona o caret depois que o React grava o novo texto.
         pendingSelection.current = pos
         const ta = taRef.current
         if (ta) {
@@ -122,16 +125,20 @@ const GhostEditor = forwardRef<GhostEditorHandle, GhostEditorProps>(
       ta.style.height = `${ta.scrollHeight}px`
     }, [value, suggestion])
 
-    const applyPendingSelection = () => {
-      if (pendingSelection.current != null) {
-        const ta = taRef.current
-        if (ta) {
-          ta.selectionStart = pendingSelection.current
-          ta.selectionEnd = pendingSelection.current
-        }
-        pendingSelection.current = null
+    // Reposiciona o caret DEPOIS que o React grava o novo `value`. Reposicionar
+    // um textarea controlado antes do commit não adianta (o browser joga o caret
+    // para o fim ao regravar `value`), e drenar isto no rAF do onChange fazia o
+    // valor pendente ser reaplicado na PRÓXIMA tecla — era o "salto de cursor"
+    // após aceitar sugestão/undo/redo. Aqui drenamos uma única vez, no commit.
+    useLayoutEffect(() => {
+      if (pendingSelection.current == null) return
+      const ta = taRef.current
+      if (ta) {
+        ta.selectionStart = pendingSelection.current
+        ta.selectionEnd = pendingSelection.current
       }
-    }
+      pendingSelection.current = null
+    }, [value])
 
     return (
       <div
@@ -157,8 +164,10 @@ const GhostEditor = forwardRef<GhostEditorHandle, GhostEditorProps>(
           autoCorrect="off"
           aria-label="Editor de notas"
           onChange={(e) => {
+            // Digitação nativa manda no caret: qualquer reposição programática
+            // pendente vira obsoleta e não pode ser reaplicada por cima.
+            pendingSelection.current = null
             onChange(e.target.value, e.target.selectionStart)
-            requestAnimationFrame(applyPendingSelection)
           }}
           onSelect={(e) => {
             onCursorChange(e.currentTarget.selectionStart)
