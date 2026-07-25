@@ -152,17 +152,21 @@ export function describeEditKit(edits: EditOp[], missed = 0): string {
  * Quebras de linha necessárias em volta de um texto inserido, contando as que já
  * existem: `\n\n` cego somaria a uma quebra existente e abriria um vão duplo no
  * preview de Markdown.
+ *
+ * `want` é quantas quebras o trecho pede de cada lado: 2 separa parágrafos (o
+ * padrão), 1 encosta um item no anterior dentro de uma lista compacta.
  */
 export function padForInsert(
   before: string,
   after: string,
+  want = 2,
 ): { lead: string; tail: string } {
   const countBreaks = (s: string) => (s.match(/\n/g) ?? []).length
   const tailWs = /[ \t\n]*$/.exec(before)?.[0] ?? ''
   const headWs = /^[ \t\n]*/.exec(after)?.[0] ?? ''
   return {
-    lead: before.trim() === '' ? '' : '\n'.repeat(Math.max(0, 2 - countBreaks(tailWs))),
-    tail: after.trim() === '' ? '' : '\n'.repeat(Math.max(0, 2 - countBreaks(headWs))),
+    lead: before.trim() === '' ? '' : '\n'.repeat(Math.max(0, want - countBreaks(tailWs))),
+    tail: after.trim() === '' ? '' : '\n'.repeat(Math.max(0, want - countBreaks(headWs))),
   }
 }
 

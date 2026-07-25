@@ -15,10 +15,11 @@ The user wants to change how the AI inline suggestion works: prompt engineering,
 
 ### Architecture
 
-- `GhostEditor.tsx` is a transparent `<textarea>` with a synchronized `<div>` mirror that renders the suggestion as dimmed "ghost" text (`components/GhostEditor.tsx:14-41`).
+- `GhostEditor.tsx` is a transparent `<textarea>` with a synchronized `<div>` mirror that renders the suggestion as dimmed "ghost" text (`components/GhostEditor.tsx:14-41`). A prop recebe o **plano** (`ghost: GhostRender | null`, com `at`/`lead`/`text`/`tail`), não uma string: o espelho desenha o ghost em `ghost.at` — onde ele SERÁ aplicado — e mantém `lead`/`tail` fora do `<span class="ghost-suggestion">`, senão o realce vira um retângulo vazio no lugar das quebras.
 - `Home.tsx` owns the completion orchestration: debounce, abort, cache lookup, OpenAI call, ghost display, and an undo/redo stack for accepted suggestions / AI edits / voice insertions (`pages/Home.tsx:388-481`, `pages/Home.tsx:330-387`).
 - `lib/suggestionCache.ts` is a `localStorage` LRU keyed by a hash of 400 chars before + 60 chars after the cursor (`lib/suggestionCache.ts:7-8`).
 - `lib/openai.ts` contains `fetchCompletion`, which is **non-streaming** (`lib/openai.ts:163-176`). All chat calls funnel through one `chatCompletion` wrapper (`lib/openai.ts:37`).
+- **A sugestão ghost é uma edição POSICIONAL, não uma emenda no cursor** (`lib/ghostPlan.ts`). `fetchCompletion` devolve só a continuação; `planGhost(full, cursor, raw)` decide **onde** ela entra (`at`, que pode diferir do cursor) e **quais quebras faltam** (`lead`/`tail`), e `applyGhostPlan` aplica via `applyEditKit` com âncora literal — o mesmo padrão do "Editar com IA" —, caindo para o splice por offset quando não existe âncora única (`uniqueAnchorBefore` cresce de 16 em 16 até 240 chars). O offset é exato porque digitar ou mover o cursor descarta a sugestão antes de qualquer aceite.
 - `lib/openai.ts` has **several** generation paths, and they are not interchangeable:
   - `fetchCompletion` continues the text on its own (ghost + Tab).
   - `fetchGuidedSuggestion` takes a user **briefing** and writes new text delivered through a preview dialog (`components/AskSuggestionDialog.tsx`).
@@ -38,6 +39,19 @@ The user wants to change how the AI inline suggestion works: prompt engineering,
 - Cache: max 120 entries, values capped at 600 chars (`lib/suggestionCache.ts:7-8`).
 - Sanitization is split in two: `normalizeModelText` (CRLF + ``` fence unwrap) is generic and shared, while `sanitizeCompletion` adds the **continuation-only** parts — stripping overlaps of **4+** chars and `trimEnd()` that preserves leading whitespace (`lib/openai.ts:141-161`). **Do not apply the overlap strip to guided suggestions**: it is a literal-continuation heuristic and would amputate the first word of a legitimately new block.
 - `fetchCompletion` asks `chatCompletion` **not** to trim the raw model output, so a leading space in the continuation is kept (`lib/openai.ts:158-170`).
+
+### Posicionamento do ghost (`lib/ghostPlan.ts`)
+
+Regras verificadas por 20 casos (bundle esbuild + node sobre o módulo isolado):
+
+- **`kind: 'bloco'`** quando (a) o modelo já mandou quebras no começo, (b) a sugestão começa com marcador (`#`, `-`/`*`/`+`, `1.`/`1)`, `>`), ou (c) o cursor está no FIM de um título já escrito e a sugestão começa frase nova. Fora disso, `'inline'` — o comportamento antigo, preservado de propósito: um falso positivo aqui escreve no lugar errado do texto do usuário.
+- **`OPEN_END`** (espaço, vírgula, hífen, abre-aspas antes do cursor) desliga a regra (c): `"## Relatório de "` + `"Vendas"` completa o título em vez de abrir um parágrafo. Sem essa guarda a regra do título dispara em título ainda em construção.
+- **Sugestão de bloco nunca parte a linha**: com texto depois do cursor, a âncora vai para o fim da linha (título/item de lista) ou para o fim do parágrafo (`endOfParagraph`).
+- **`padForInsert(before, after, want = 2)`** (em `lib/editKit.ts`) ganhou o terceiro parâmetro: item de lista compacta pede `want = 1` (encosta no anterior), título e parágrafo pedem 2. Lista "solta" (linha em branco entre itens) volta a pedir 2.
+- **A numeração é do documento, não do modelo**: `renumber` reescreve os itens de topo da sugestão a partir de `blk.num + 1`, herdando separador (`.`/`)`) e prefixo de título. O modelo repete o número atual ou recomeça do 1 com frequência.
+- **`NUMBERED`/`BLOCK_START` limitam a 3 dígitos** (`\d{1,3}`): `2010. ` no começo de uma frase é ano, não item de lista — com `\d{1,9}` a prosa era renumerada.
+- **Dentro de cerca ```` ``` ```` é sempre `inline`**: código não leva espaçamento de Markdown.
+- `describeCursorContext(full, cursor)` alimenta `<posicao_do_cursor>` no prompt do autocomplete. É calculado sobre o texto **inteiro** e passado de fora porque `buildUserPrompt` só recebe o recorte (`MAX_BEFORE`/`MAX_AFTER`), que pode cortar a abertura da cerca de código.
 
 ### Key behaviors
 
