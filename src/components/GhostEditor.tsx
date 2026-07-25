@@ -13,12 +13,24 @@ export interface GhostEditorHandle {
   getSelection: () => { start: number; end: number }
 }
 
+/**
+ * Sugestão já posicionada (`GhostPlan`, `lib/ghostPlan.ts`): o ghost é desenhado
+ * em `at`, que nem sempre é o cursor, e com as quebras que faltavam — é assim
+ * que o usuário vê, antes do Tab, que a sugestão abre um parágrafo novo.
+ */
+export interface GhostRender {
+  at: number
+  lead: string
+  text: string
+  tail: string
+}
+
 interface GhostEditorProps {
   value: string
   cursor: number
   onChange: (value: string, cursorPos: number) => void
   onCursorChange: (pos: number) => void
-  suggestion: string | null
+  ghost: GhostRender | null
   onAcceptSuggestion: () => void
   onDismissSuggestion: () => void
   onManualTrigger: () => void
@@ -53,7 +65,7 @@ const GhostEditor = forwardRef<GhostEditorHandle, GhostEditorProps>(
       cursor,
       onChange,
       onCursorChange,
-      suggestion,
+      ghost,
       onAcceptSuggestion,
       onDismissSuggestion,
       onManualTrigger,
@@ -104,18 +116,26 @@ const GhostEditor = forwardRef<GhostEditorHandle, GhostEditorProps>(
     }))
 
     const mirrorHtml = useMemo(() => {
-      if (value.length === 0) {
+      if (value.length === 0 && !ghost) {
         return `<span style="color: var(--dracula-comment)">${escapeHtml(PLACEHOLDER)}</span>`
       }
-      const pos = Math.min(cursor, value.length)
+      // O ghost é desenhado onde SERÁ aplicado, não onde o cursor está: uma
+      // sugestão que abre bloco entra no fim da linha/parágrafo atual.
+      const pos = ghost
+        ? Math.min(Math.max(ghost.at, 0), value.length)
+        : Math.min(cursor, value.length)
       const before = escapeHtml(value.slice(0, pos))
       const after = escapeHtml(value.slice(pos))
-      const ghost = suggestion
-        ? `<span class="ghost-suggestion">${escapeHtml(suggestion)}</span>`
+      // `lead`/`tail` ficam fora do <span> para o realce cobrir só o texto
+      // sugerido, e não um retângulo vazio no lugar das quebras.
+      const ghostHtml = ghost
+        ? escapeHtml(ghost.lead) +
+          `<span class="ghost-suggestion">${escapeHtml(ghost.text)}</span>` +
+          escapeHtml(ghost.tail)
         : ''
       // \u200B final garante a altura quando o texto termina em quebra de linha
-      return before + ghost + after + '&#8203;'
-    }, [value, cursor, suggestion])
+      return before + ghostHtml + after + '&#8203;'
+    }, [value, cursor, ghost])
 
     // faz o textarea crescer junto com o conteúdo, eliminando scroll interno
     useLayoutEffect(() => {
@@ -123,7 +143,7 @@ const GhostEditor = forwardRef<GhostEditorHandle, GhostEditorProps>(
       if (!ta) return
       ta.style.height = 'auto'
       ta.style.height = `${ta.scrollHeight}px`
-    }, [value, suggestion])
+    }, [value, ghost])
 
     // Reposiciona o caret DEPOIS que o React grava o novo `value`. Reposicionar
     // um textarea controlado antes do commit não adianta (o browser joga o caret
@@ -177,7 +197,7 @@ const GhostEditor = forwardRef<GhostEditorHandle, GhostEditorProps>(
 
             if (e.key === 'Tab') {
               e.preventDefault()
-              if (suggestion) {
+              if (ghost) {
                 if (acceptCooldownRef.current) return
                 acceptCooldownRef.current = true
                 window.setTimeout(() => {
@@ -194,7 +214,7 @@ const GhostEditor = forwardRef<GhostEditorHandle, GhostEditorProps>(
               }
               return
             }
-            if (e.key === 'Escape' && suggestion) {
+            if (e.key === 'Escape' && ghost) {
               e.preventDefault()
               e.stopPropagation()
               onDismissSuggestion()

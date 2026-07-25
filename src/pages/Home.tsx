@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Columns2,
   Command,
+  CornerDownLeft,
   Eye,
   FileDown,
   FileText,
@@ -115,6 +116,12 @@ import {
   insertTextAtAnchor,
   type EditOp,
 } from '@/lib/editKit'
+import {
+  applyGhostPlan,
+  describeCursorContext,
+  planGhost,
+  type GhostPlan,
+} from '@/lib/ghostPlan'
 import { LOGO_URL } from '@/lib/brand'
 import { getCached, invalidate, setCached } from '@/lib/suggestionCache'
 import {
@@ -131,6 +138,12 @@ import { downloadNoteImage, downloadNotePdf } from '@/lib/export'
 interface Suggestion {
   text: string
   source: 'api' | 'memoria'
+  /**
+   * Onde a sugestão entra e com quais quebras. O modelo devolve só a
+   * continuação; o plano é recalculado sobre o texto atual toda vez que a
+   * sugestão é exibida (inclusive vinda da memória, que guarda o texto cru).
+   */
+  plan: GhostPlan
 }
 
 interface HistoryItem {
@@ -748,7 +761,8 @@ export default function Home() {
       if (!force) {
         const mem = getCached(before, after)
         if (mem) {
-          setSuggestion({ text: mem, source: 'memoria' })
+          const plan = planGhost(full, pos, mem)
+          if (plan) setSuggestion({ text: plan.text, source: 'memoria', plan })
           return
         }
       } else {
@@ -765,6 +779,7 @@ export default function Home() {
           model,
           beforeCursor: before,
           afterCursor: after,
+          cursorContext: describeCursorContext(full, pos),
           attachments: (active?.attachments ?? []).map((a) => ({
             name: a.name,
             content: a.content,
@@ -777,7 +792,8 @@ export default function Home() {
           // se o usuário continuou digitando enquanto a API respondia,
           // guarda na memória mas não exibe a sugestão desatualizada
           if (cursorRef.current === pos && textRef.current === full) {
-            setSuggestion({ text: out, source: 'api' })
+            const plan = planGhost(full, pos, out)
+            if (plan) setSuggestion({ text: plan.text, source: 'api', plan })
           }
         } else if (force) {
           toast('A IA não encontrou continuação para este ponto.')
@@ -807,14 +823,14 @@ export default function Home() {
     if (!suggestion || isAcceptingRef.current) return
     isAcceptingRef.current = true
     recordHistory()
-    const pos = cursorRef.current
-    const full = textRef.current
-    const next = full.slice(0, pos) + suggestion.text + full.slice(pos)
+    // O plano é uma edição posicional, no mesmo padrão do kit: entra na âncora
+    // que ele calculou (nem sempre o cursor) e já traz as quebras que faltavam.
+    const { text: next, caret } = applyGhostPlan(textRef.current, suggestion.plan)
     textRef.current = next
-    cursorRef.current = pos + suggestion.text.length
+    cursorRef.current = caret
     updateActive({ content: next })
-    setCursor(pos + suggestion.text.length)
-    editorRef.current?.setCursor(pos + suggestion.text.length)
+    setCursor(caret)
+    editorRef.current?.setCursor(caret)
     setSuggestion(null)
     scheduleCompletion()
     tourAction('aceitar')
@@ -1923,7 +1939,7 @@ export default function Home() {
                 cursor={cursor}
                 onChange={handleChange}
                 onCursorChange={handleCursorChange}
-                suggestion={suggestion?.text ?? null}
+                ghost={suggestion?.plan ?? null}
                 onAcceptSuggestion={acceptSuggestion}
                 onDismissSuggestion={() => setSuggestion(null)}
                 onManualTrigger={() => void requestCompletion(false)}
@@ -1946,7 +1962,7 @@ export default function Home() {
                     cursor={cursor}
                     onChange={handleChange}
                     onCursorChange={handleCursorChange}
-                    suggestion={suggestion?.text ?? null}
+                    ghost={suggestion?.plan ?? null}
                     onAcceptSuggestion={acceptSuggestion}
                     onDismissSuggestion={() => setSuggestion(null)}
                     onManualTrigger={() => void requestCompletion(false)}
@@ -2019,6 +2035,13 @@ export default function Home() {
                 <Sparkles className="h-3 w-3" /> via API
               </>
             )}
+          </span>
+        )}
+        {/* a sugestão nem sempre entra no cursor — o rótulo diz para onde ela vai */}
+        {suggestion?.plan.kind === 'bloco' && (
+          <span className="hidden items-center gap-1 whitespace-nowrap rounded-full bg-[#50fa7b]/15 px-2 py-0.5 font-semibold text-[#50fa7b] sm:flex">
+            <CornerDownLeft className="h-3 w-3" />
+            {suggestion.plan.at === cursor ? 'novo parágrafo' : 'no fim do bloco'}
           </span>
         )}
 

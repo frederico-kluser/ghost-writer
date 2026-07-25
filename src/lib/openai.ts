@@ -13,6 +13,8 @@ export interface CompletionRequest {
   beforeCursor: string
   afterCursor: string
   attachments: AttachmentContext[]
+  /** Descrição do bloco sob o cursor (`describeCursorContext`, `lib/ghostPlan.ts`). */
+  cursorContext?: string
   signal?: AbortSignal
 }
 
@@ -115,6 +117,9 @@ function buildSystemPrompt(): string {
     '- Se existir texto depois do cursor, a continuação deve conectar-se de forma coerente com ele (complete a palavra/frase quebrada, não a repita).',
     '- Use os arquivos anexados somente como contexto (termos, nomes, estilo); nunca os reproduza por inteiro.',
     '- Se o documento for Markdown, respeite a sintaxe Markdown.',
+    '- Um título (linha iniciada por #) ocupa uma linha só: com o cursor no FIM de um título já escrito, não continue a mesma linha — escreva o parágrafo do corpo, começando por uma frase nova.',
+    '- Em seções ou listas numeradas, NUNCA repita o número atual: o item seguinte a "2." é "3.". Se o documento numera títulos ("## 2. …"), mantenha o mesmo formato ao abrir a seção seguinte.',
+    '- Não repita o marcador da linha em que o cursor já está (#, -, 1.), a menos que esteja começando um item ou uma seção NOVA.',
     '- Se não houver continuação razoável, retorne uma string vazia.',
   ].join('\n')
 }
@@ -136,9 +141,15 @@ function buildAttachmentsBlock(attachments: AttachmentContext[]): string {
 function buildUserPrompt(req: CompletionRequest): string {
   const before = req.beforeCursor.slice(-MAX_BEFORE)
   const after = req.afterCursor.slice(0, MAX_AFTER)
+  // O recorte de contexto pode cortar o começo do documento, então a estrutura
+  // do bloco sob o cursor vem calculada de fora, sobre o texto inteiro.
+  const posicao = req.cursorContext
+    ? `<posicao_do_cursor>\n${req.cursorContext}\n</posicao_do_cursor>\n\n`
+    : ''
 
   return (
     buildAttachmentsBlock(req.attachments) +
+    posicao +
     `<texto_antes_do_cursor>\n${before}\n</texto_antes_do_cursor>\n` +
     `[CURSOR]\n` +
     `<texto_depois_do_cursor>\n${after}\n</texto_depois_do_cursor>\n\n` +
